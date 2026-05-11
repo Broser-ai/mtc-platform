@@ -15,9 +15,13 @@ export interface OpenRouterResponse {
 
 // Approximate cost per 1M tokens (input/output average) for estimation
 const MODEL_COST_PER_1M: Record<string, number> = {
-  "anthropic/claude-opus-4": 18.75,
+  "anthropic/claude-opus-4.6": 18.75,
+  "anthropic/claude-sonnet-4.6": 6.0,
+  "anthropic/claude-haiku-4.5": 1.5,
   "openai/gpt-4o": 6.25,
-  "google/gemini-2.5-pro-preview": 3.75,
+  "google/gemini-2.5-pro": 3.75,
+  "google/gemini-3-flash-preview": 1.0,
+  "deepseek/deepseek-r1": 2.0,
 };
 
 export function estimateCost(model: string, estimatedTokens: number): number {
@@ -49,13 +53,24 @@ export async function callOpenRouter(
   }
 
   const data = await res.json();
+
+  // Defensive parsing — OpenRouter can return 200 with error payload
+  if (!data.choices || !Array.isArray(data.choices) || data.choices.length === 0) {
+    throw new Error(`OpenRouter returned no choices. Response: ${JSON.stringify(data).slice(0, 500)}`);
+  }
+
+  const firstChoice = data.choices[0];
+  if (!firstChoice?.message?.content) {
+    throw new Error(`OpenRouter returned malformed choice: ${JSON.stringify(firstChoice).slice(0, 300)}`);
+  }
+
   const latency_ms = Date.now() - start;
   const usage = data.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   const rate = MODEL_COST_PER_1M[model] ?? 5;
   const cost_usd = (usage.total_tokens / 1_000_000) * rate;
 
   return {
-    content: data.choices[0].message.content,
+    content: firstChoice.message.content,
     model: data.model ?? model,
     usage,
     cost_usd,
