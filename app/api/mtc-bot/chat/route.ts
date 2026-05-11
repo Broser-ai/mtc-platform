@@ -75,14 +75,26 @@ async function phase1Plan(
         content: `Brief: ${brief}\n\nTilgængelige departments (udvalg):\n${deptContext}\n\nTilgængelige masters:\n${masterContext}`,
       },
     ],
-    1200
+    6000  // increased from 1200 — full plan with expert_prompts can exceed 1200 tokens
   );
 
   let raw = response.content.trim();
   if (raw.startsWith("```")) raw = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
 
+  let plan: BotPlan;
+  try {
+    plan = JSON.parse(raw) as BotPlan;
+  } catch (parseErr) {
+    const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+    // Log first/last 200 chars to help debug truncation
+    const preview = raw.length > 400
+      ? `${raw.slice(0, 200)}...[${raw.length - 400} chars]...${raw.slice(-200)}`
+      : raw;
+    throw new Error(`Failed to parse bot plan JSON (${errMsg}). Tokens used: ${response.usage.completion_tokens}/${6000}. Response preview: ${preview}`);
+  }
+
   return {
-    plan: JSON.parse(raw) as BotPlan,
+    plan,
     usage: response.usage,
     cost_usd: response.cost_usd,
     latency_ms: response.latency_ms,
@@ -168,7 +180,7 @@ async function phase3Execute(
   return Promise.all(calls);
 }
 
-// ── Phase 4: Synthesize ──────────────────────────────────
+// ── Phase 4: Synthesize ─────────────────────────────────
 async function phase4Synthesize(
   brief: string,
   expertResults: ExpertResult[],
