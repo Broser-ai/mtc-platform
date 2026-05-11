@@ -6,7 +6,10 @@ import { logAuditEntry } from "@/lib/audit";
 
 export const maxDuration = 120;
 
-// ── Types ────────────────────────────────────────────────────
+// Default model — current valid OpenRouter catalog as of May 2026
+const DEFAULT_MODEL = "anthropic/claude-opus-4.6";
+
+// ── Types ──────────────────────────────────────────
 interface DeptRow { id: string; name: string; description: string | null; tier_name: string | null }
 interface MasterRow { id: string; department_id: string; name: string; affiliation: string | null; bio: string | null; default_gateway: string | null }
 interface EcosystemRow { id: string; name: string; openrouter_model_string: string }
@@ -43,14 +46,13 @@ interface ExpertResult {
   ok: boolean;
 }
 
-// ── Phase 1: Plan ────────────────────────────────────────────
+// ── Phase 1: Plan ───────────────────────────────────
 async function phase1Plan(
   brief: string,
   departments: DeptRow[],
   masters: MasterRow[],
   ecosystemMap: Map<string, string>
 ) {
-  // Limit context to avoid huge prompts — take first 30 depts and their masters
   const relevantDepts = departments.slice(0, 30);
   const relevantDeptIds = new Set(relevantDepts.map(d => d.id));
   const relevantMasters = masters.filter(m => relevantDeptIds.has(m.department_id)).slice(0, 60);
@@ -60,12 +62,12 @@ async function phase1Plan(
   ).join("\n");
 
   const masterContext = relevantMasters.map(m => {
-    const model = ecosystemMap.get(m.default_gateway ?? "") ?? "anthropic/claude-opus-4";
+    const model = ecosystemMap.get(m.default_gateway ?? "") ?? DEFAULT_MODEL;
     return `"${m.id}" (dept: ${m.department_id}): ${m.name}, ${m.affiliation ?? ""}. Model: ${model}`;
   }).join("\n");
 
   const response = await callOpenRouter(
-    "anthropic/claude-opus-4",
+    DEFAULT_MODEL,
     [
       { role: "system", content: MTC_BOT_SYSTEM_PROMPT },
       {
@@ -87,7 +89,7 @@ async function phase1Plan(
   };
 }
 
-// ── Phase 3: Execute (parallel expert calls) ─────────────────
+// ── Phase 3: Execute (parallel expert calls) ──────────────
 async function phase3Execute(
   plan: BotPlan,
   masters: MasterRow[],
@@ -100,8 +102,8 @@ async function phase3Execute(
   const calls = plan.squad.map(async (squadMember) => {
     const master = masterMap.get(squadMember.master_id);
     const model = master
-      ? (ecosystemMap.get(master.default_gateway ?? "") ?? squadMember.model ?? "anthropic/claude-opus-4")
-      : (squadMember.model ?? "anthropic/claude-opus-4");
+      ? (ecosystemMap.get(master.default_gateway ?? "") ?? squadMember.model ?? DEFAULT_MODEL)
+      : (squadMember.model ?? DEFAULT_MODEL);
 
     const expertPrompt = plan.expert_prompts[squadMember.master_id]
       ?? `As ${squadMember.master_name}, provide your expert analysis on: ${plan.plan_summary}`;
@@ -166,7 +168,7 @@ async function phase3Execute(
   return Promise.all(calls);
 }
 
-// ── Phase 4: Synthesize ──────────────────────────────────────
+// ── Phase 4: Synthesize ──────────────────────────────────
 async function phase4Synthesize(
   brief: string,
   expertResults: ExpertResult[],
@@ -179,7 +181,7 @@ async function phase4Synthesize(
   }));
 
   const result = await callOpenRouter(
-    "anthropic/claude-opus-4",
+    DEFAULT_MODEL,
     [{ role: "user", content: SYNTHESIS_PROMPT(brief, expertOutputs) }],
     2048
   );
@@ -188,7 +190,7 @@ async function phase4Synthesize(
     user_id: userId,
     execution_id: executionId,
     phase: "synthesize",
-    model: "anthropic/claude-opus-4",
+    model: DEFAULT_MODEL,
     prompt_tokens: result.usage.prompt_tokens,
     completion_tokens: result.usage.completion_tokens,
     cost_usd: result.cost_usd,
@@ -199,7 +201,7 @@ async function phase4Synthesize(
   return result;
 }
 
-// ── POST /api/mtc-bot/chat ───────────────────────────────────
+// ── POST /api/mtc-bot/chat ────────────────────────────
 export async function POST(req: Request) {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
@@ -226,7 +228,7 @@ export async function POST(req: Request) {
     (ecosystems ?? []).map((e: EcosystemRow) => [e.id, e.openrouter_model_string])
   );
 
-  // ── Phase 1: Plan ──────────────────────────────────────────
+  // ── Phase 1: Plan ──────────────────────────────────
   if (!body.phase || body.phase === "plan") {
     if (!body.brief) return NextResponse.json({ error: "brief required" }, { status: 400 });
 
@@ -253,7 +255,7 @@ export async function POST(req: Request) {
       user_id: user.id,
       execution_id: execution!.id,
       phase: "plan",
-      model: "anthropic/claude-opus-4",
+      model: DEFAULT_MODEL,
       prompt_tokens: usage.prompt_tokens,
       completion_tokens: usage.completion_tokens,
       cost_usd,
@@ -265,7 +267,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ phase: "plan", execution_id: execution!.id, plan });
   }
 
-  // ── Phase 3-5: Execute → Synthesize → Audit ───────────────
+  // ── Phase 3-5: Execute → Synthesize → Audit ────────────
   if (body.phase === "execute") {
     const { execution_id, plan, brief } = body;
     if (!execution_id || !plan) return NextResponse.json({ error: "execution_id + plan required" }, { status: 400 });
