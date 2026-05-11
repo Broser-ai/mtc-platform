@@ -17,13 +17,13 @@ export async function GET(request: Request) {
           getAll() {
             return cookieStore.getAll()
           },
-          setAll(cookiesToSet: Array<{ name: string; value: string; options?: Record<string, unknown> }>) {
+          setAll(cookiesToSet) {
             try {
               cookiesToSet.forEach(({ name, value, options }) =>
-                cookieStore.set(name, value, options as Parameters<typeof cookieStore.set>[2])
+                cookieStore.set(name, value, options)
               )
             } catch {
-              // Server component context
+              // Server component context — can be ignored
             }
           },
         },
