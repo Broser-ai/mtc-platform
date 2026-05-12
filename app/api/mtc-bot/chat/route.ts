@@ -13,6 +13,7 @@ const DEFAULT_MODEL = "anthropic/claude-opus-4.6";
 interface DeptRow { id: string; name: string; description: string | null; tier_name: string | null }
 interface MasterRow { id: string; department_id: string; name: string; affiliation: string | null; bio: string | null; default_gateway: string | null }
 interface EcosystemRow { id: string; name: string; openrouter_model_string: string }
+interface MasterSkillRow { master_id: string; skill_id: string; priority: number | null; use_case: string | null }
 
 interface SquadMember {
   master_id: string;
@@ -33,6 +34,7 @@ export interface BotPlan {
   risk_class: string;
   plan_summary: string;
   expert_prompts: Record<string, string>;
+  invoked_skills?: Array<{ master_id: string; skill_id: string; reason: string }>;
 }
 
 interface ExpertResult {
@@ -51,7 +53,8 @@ async function phase1Plan(
   brief: string,
   departments: DeptRow[],
   masters: MasterRow[],
-  ecosystemMap: Map<string, string>
+  ecosystemMap: Map<string, string>,
+  skillsByMaster: Map<string, MasterSkillRow[]>
 ) {
   const relevantDepts = departments.slice(0, 30);
   const relevantDeptIds = new Set(relevantDepts.map(d => d.id));
@@ -63,7 +66,13 @@ async function phase1Plan(
 
   const masterContext = relevantMasters.map(m => {
     const model = ecosystemMap.get(m.default_gateway ?? "") ?? DEFAULT_MODEL;
-    return `"${m.id}" (dept: ${m.department_id}): ${m.name}, ${m.affiliation ?? ""}. Model: ${model}`;
+    const skills = skillsByMaster.get(m.id) ?? [];
+    // Top 3 skills per master — keep context window tight
+    const topSkills = skills.slice(0, 3);
+    const skillStr = topSkills.length > 0
+      ? ` | Skills: ${topSkills.map(s => `${s.skill_id}${s.use_case ? ` (${s.use_case})` : ""}`).join("; ")}`
+      : "";
+    return `"${m.id}" (dept: ${m.department_id}): ${m.name}, ${m.affiliation ?? ""}. Model: ${model}${skillStr}`;
   }).join("\n");
 
   const response = await callOpenRouter(
@@ -72,10 +81,10 @@ async function phase1Plan(
       { role: "system", content: MTC_BOT_SYSTEM_PROMPT },
       {
         role: "user",
-        content: `Brief: ${brief}\n\nTilgængelige departments (udvalg):\n${deptContext}\n\nTilgængelige masters:\n${masterContext}`,
+        content: `Brief: ${brief}\n\nTilgængelige departments (udvalg):\n${deptContext}\n\nTilgængelige masters (med deres skills):\n${masterContext}`,
       },
     ],
-    6000  // increased from 1200 — full plan with expert_prompts can exceed 1200 tokens
+    6000
   );
 
   let raw = response.content.trim();
@@ -86,7 +95,6 @@ async function phase1Plan(
     plan = JSON.parse(raw) as BotPlan;
   } catch (parseErr) {
     const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-    // Log first/last 200 chars to help debug truncation
     const preview = raw.length > 400
       ? `${raw.slice(0, 200)}...[${raw.length - 400} chars]...${raw.slice(-200)}`
       : raw;
@@ -230,15 +238,28 @@ export async function POST(req: Request) {
   const svc = await createServiceClient();
 
   // Load lookup data used by both phases
-  const [{ data: departments }, { data: masters }, { data: ecosystems }] = await Promise.all([
+  const [
+    { data: departments },
+    { data: masters },
+    { data: ecosystems },
+    { data: masterSkills },
+  ] = await Promise.all([
     svc.from("departments").select("id, name, description, tier_name").order("display_order"),
     svc.from("masters").select("id, department_id, name, affiliation, bio, default_gateway").order("display_order"),
     svc.from("ai_ecosystems").select("id, name, openrouter_model_string"),
+    svc.from("master_skills").select("master_id, skill_id, priority, use_case").order("priority", { ascending: true }),
   ]);
 
   const ecosystemMap = new Map<string, string>(
     (ecosystems ?? []).map((e: EcosystemRow) => [e.id, e.openrouter_model_string])
   );
+
+  // Build skillsByMaster lookup: master_id → array of skills (sorted by priority asc)
+  const skillsByMaster = new Map<string, MasterSkillRow[]>();
+  (masterSkills ?? []).forEach((ms: MasterSkillRow) => {
+    if (!skillsByMaster.has(ms.master_id)) skillsByMaster.set(ms.master_id, []);
+    skillsByMaster.get(ms.master_id)!.push(ms);
+  });
 
   // ── Phase 1: Plan ──────────────────────────────────
   if (!body.phase || body.phase === "plan") {
@@ -248,7 +269,8 @@ export async function POST(req: Request) {
       body.brief,
       (departments ?? []) as DeptRow[],
       (masters ?? []) as MasterRow[],
-      ecosystemMap
+      ecosystemMap,
+      skillsByMaster
     );
 
     const { data: execution } = await svc.from("executions").insert({
@@ -263,9 +285,13 @@ export async function POST(req: Request) {
       plan,
     }).select("id").single();
 
+    if (!execution) {
+      throw new Error("Failed to create execution row \u2014 check DB constraints (user_id FK to profiles, pattern_id NOT NULL)");
+    }
+
     await logAuditEntry({
       user_id: user.id,
-      execution_id: execution!.id,
+      execution_id: execution.id,
       phase: "plan",
       model: DEFAULT_MODEL,
       prompt_tokens: usage.prompt_tokens,
@@ -273,10 +299,10 @@ export async function POST(req: Request) {
       cost_usd,
       latency_ms,
       status: "ok",
-      details: { task_type: plan.task_type, squad_size: plan.squad.length },
+      details: { task_type: plan.task_type, squad_size: plan.squad.length, invoked_skills_count: plan.invoked_skills?.length ?? 0 },
     });
 
-    return NextResponse.json({ phase: "plan", execution_id: execution!.id, plan });
+    return NextResponse.json({ phase: "plan", execution_id: execution.id, plan });
   }
 
   // ── Phase 3-5: Execute → Synthesize → Audit ────────────
