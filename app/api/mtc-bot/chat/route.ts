@@ -14,6 +14,7 @@ interface DeptRow { id: string; name: string; description: string | null; tier_n
 interface MasterRow { id: string; department_id: string; name: string; affiliation: string | null; bio: string | null; default_gateway: string | null }
 interface EcosystemRow { id: string; name: string; openrouter_model_string: string }
 interface MasterSkillRow { master_id: string; skill_id: string; priority: number | null; use_case: string | null }
+interface SkillBody { id: string; name: string; body: string | null }
 
 interface SquadMember {
   master_id: string;
@@ -22,6 +23,12 @@ interface SquadMember {
   gateway: string;
   model: string;
   role_in_brief: string;
+}
+
+interface InvokedSkill {
+  master_id: string;
+  skill_id: string;
+  reason: string;
 }
 
 export interface BotPlan {
@@ -34,7 +41,7 @@ export interface BotPlan {
   risk_class: string;
   plan_summary: string;
   expert_prompts: Record<string, string>;
-  invoked_skills?: Array<{ master_id: string; skill_id: string; reason: string }>;
+  invoked_skills?: InvokedSkill[];
 }
 
 interface ExpertResult {
@@ -46,6 +53,7 @@ interface ExpertResult {
   latency_ms: number;
   model: string;
   ok: boolean;
+  invoked_skill_ids: string[];
 }
 
 // ── Phase 1: Plan ───────────────────────────────────
@@ -67,7 +75,6 @@ async function phase1Plan(
   const masterContext = relevantMasters.map(m => {
     const model = ecosystemMap.get(m.default_gateway ?? "") ?? DEFAULT_MODEL;
     const skills = skillsByMaster.get(m.id) ?? [];
-    // Top 3 skills per master — keep context window tight
     const topSkills = skills.slice(0, 3);
     const skillStr = topSkills.length > 0
       ? ` | Skills: ${topSkills.map(s => `${s.skill_id}${s.use_case ? ` (${s.use_case})` : ""}`).join("; ")}`
@@ -114,10 +121,12 @@ async function phase3Execute(
   plan: BotPlan,
   masters: MasterRow[],
   ecosystemMap: Map<string, string>,
+  skillsCatalog: Map<string, SkillBody>,
   executionId: string,
   userId: string
 ): Promise<ExpertResult[]> {
   const masterMap = new Map(masters.map(m => [m.id, m]));
+  const invokedSkills = plan.invoked_skills ?? [];
 
   const calls = plan.squad.map(async (squadMember) => {
     const master = masterMap.get(squadMember.master_id);
@@ -125,20 +134,37 @@ async function phase3Execute(
       ? (ecosystemMap.get(master.default_gateway ?? "") ?? squadMember.model ?? DEFAULT_MODEL)
       : (squadMember.model ?? DEFAULT_MODEL);
 
+    // ── Skill body injection ────────────────────────
+    // Find which skills the bot invoked for THIS specific master
+    const skillsForThisMaster = invokedSkills.filter(
+      inv => inv.master_id === squadMember.master_id
+    );
+    const invokedSkillIds = skillsForThisMaster.map(s => s.skill_id);
+
+    const skillBodiesBlock = skillsForThisMaster
+      .map(inv => {
+        const skill = skillsCatalog.get(inv.skill_id);
+        if (!skill?.body) return null;
+        return `### SKILL: ${skill.name} (id: ${inv.skill_id})\n**Why invoked for this task:** ${inv.reason}\n\n${skill.body}`;
+      })
+      .filter((b): b is string => b !== null)
+      .join("\n\n---\n\n");
+
     const expertPrompt = plan.expert_prompts[squadMember.master_id]
       ?? `As ${squadMember.master_name}, provide your expert analysis on: ${plan.plan_summary}`;
+
+    const systemContent = `You are ${squadMember.master_name}${master?.affiliation ? ` (${master.affiliation})` : ""}. ${master?.bio ?? ""}
+
+${skillBodiesBlock ? `## SKILLS TO USE FOR THIS TASK\n\nThe following skills have been activated for your role. Follow their processes, rules, and output formats exactly — these supersede any general knowledge.\n\n${skillBodiesBlock}\n\n## YOUR TASK\n\n` : ""}Provide expert analysis based on your background and specialization${skillBodiesBlock ? ", applying the skills above" : ""}.`;
 
     try {
       const result = await callOpenRouter(
         model,
         [
-          {
-            role: "system",
-            content: `You are ${squadMember.master_name}${master?.affiliation ? ` (${master.affiliation})` : ""}. ${master?.bio ?? ""}\n\nProvide expert analysis based on your background and specialization.`,
-          },
+          { role: "system", content: systemContent },
           { role: "user", content: expertPrompt },
         ],
-        1500
+        skillBodiesBlock ? 3000 : 1500  // larger output budget when skills active
       );
 
       await logAuditEntry({
@@ -152,7 +178,12 @@ async function phase3Execute(
         cost_usd: result.cost_usd,
         latency_ms: result.latency_ms,
         status: "ok",
-        details: { master_name: squadMember.master_name, role: squadMember.role_in_brief },
+        details: {
+          master_name: squadMember.master_name,
+          role: squadMember.role_in_brief,
+          invoked_skill_ids: invokedSkillIds,
+          skill_bytes_injected: skillBodiesBlock.length,
+        },
       });
 
       return {
@@ -164,6 +195,7 @@ async function phase3Execute(
         latency_ms: result.latency_ms,
         model,
         ok: true,
+        invoked_skill_ids: invokedSkillIds,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -174,13 +206,14 @@ async function phase3Execute(
         model,
         master_id: squadMember.master_id,
         status: "error",
-        details: { error: msg },
+        details: { error: msg, invoked_skill_ids: invokedSkillIds },
       });
       return {
         master_id: squadMember.master_id,
         master_name: squadMember.master_name,
         output: `[Error: ${msg}]`,
         cost_usd: 0, tokens: 0, latency_ms: 0, model, ok: false,
+        invoked_skill_ids: invokedSkillIds,
       };
     }
   });
@@ -254,7 +287,6 @@ export async function POST(req: Request) {
     (ecosystems ?? []).map((e: EcosystemRow) => [e.id, e.openrouter_model_string])
   );
 
-  // Build skillsByMaster lookup: master_id → array of skills (sorted by priority asc)
   const skillsByMaster = new Map<string, MasterSkillRow[]>();
   (masterSkills ?? []).forEach((ms: MasterSkillRow) => {
     if (!skillsByMaster.has(ms.master_id)) skillsByMaster.set(ms.master_id, []);
@@ -299,7 +331,12 @@ export async function POST(req: Request) {
       cost_usd,
       latency_ms,
       status: "ok",
-      details: { task_type: plan.task_type, squad_size: plan.squad.length, invoked_skills_count: plan.invoked_skills?.length ?? 0 },
+      details: {
+        task_type: plan.task_type,
+        squad_size: plan.squad.length,
+        invoked_skills_count: plan.invoked_skills?.length ?? 0,
+        invoked_skill_ids: Array.from(new Set((plan.invoked_skills ?? []).map(s => s.skill_id))),
+      },
     });
 
     return NextResponse.json({ phase: "plan", execution_id: execution.id, plan });
@@ -310,12 +347,25 @@ export async function POST(req: Request) {
     const { execution_id, plan, brief } = body;
     if (!execution_id || !plan) return NextResponse.json({ error: "execution_id + plan required" }, { status: 400 });
 
+    // ── Just-in-time skill body loading ──────────────────
+    // Only load bodies for skills the bot actually invoked
+    const invokedSkillIds = Array.from(new Set((plan.invoked_skills ?? []).map(s => s.skill_id)));
+    const skillsCatalog = new Map<string, SkillBody>();
+    if (invokedSkillIds.length > 0) {
+      const { data: skillRows } = await svc
+        .from("agent_skills")
+        .select("id, name, body")
+        .in("id", invokedSkillIds);
+      (skillRows ?? []).forEach((s: SkillBody) => skillsCatalog.set(s.id, s));
+    }
+
     await svc.from("executions").update({ status: "running", started_at: new Date().toISOString() }).eq("id", execution_id);
 
     const expertResults = await phase3Execute(
       plan,
       (masters ?? []) as MasterRow[],
       ecosystemMap,
+      skillsCatalog,
       execution_id,
       user.id
     );
