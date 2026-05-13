@@ -4,5 +4,6 @@
       "path": "/api/cron/watchers",
       "schedule": "*/15 * * * *"
     }
-  ]
+  ],
+  "$schema": "https://openapi.vercel.sh/vercel.json"
 }
