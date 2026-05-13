@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/service";
 
+// Force dynamic rendering — must NOT be cached or prerendered.
+// Each request must hit Supabase fresh; the response state depends on real-time DB.
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 /**
  * Watcher cron endpoint \u2014 triggered by Vercel cron every 15 minutes (see vercel.json).
  *
@@ -38,7 +43,7 @@ export async function GET() {
   }
 
   if (!watchers?.length) {
-    return NextResponse.json({ ok: true, ran: 0, total: 0, mode: "phase1_safe_stub" });
+    return NextResponse.json({ ok: true, ran: 0, total: 0, mode: "phase1_safe_stub", timestamp: now });
   }
 
   let ran = 0;
@@ -46,7 +51,6 @@ export async function GET() {
 
   for (const w of watchers) {
     try {
-      // Phase 1: log a successful tick without invoking any LLM.
       const runInsert = await supabase.from("watcher_runs").insert({
         watcher_id: w.id,
         status: "ticked",
@@ -59,7 +63,6 @@ export async function GET() {
         continue;
       }
 
-      // Schedule next run +1 hour ahead (Phase 2 will use schedule_cron if present)
       const nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
       await supabase
         .from("watchers")
@@ -69,7 +72,6 @@ export async function GET() {
       ran++;
     } catch (err) {
       failures.push({ id: w.id, error: String(err) });
-      // Try to log the failure to watcher_runs even if the main flow crashed
       await supabase
         .from("watcher_runs")
         .insert({
@@ -90,5 +92,6 @@ export async function GET() {
     failed: failures.length,
     failures: failures.slice(0, 5),
     mode: "phase1_safe_stub",
+    timestamp: now,
   });
 }
